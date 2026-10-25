@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BUG GENESIS — 知識庫控制台</title>
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand">BUG&nbsp;GENESIS<span>知識庫控制台</span></div>
+
+      <label class="filebtn">
+        開啟 .db
+        <input id="file" type="file" accept=".db,.sqlite,.sqlite3" />
+      </label>
+
+      <button id="replay" type="button" title="依 first_seen 依序揭示族群">▶ 重播發現過程</button>
+
+      <div class="slider">
+        <span>時間</span>
+        <input id="time" type="range" min="0" max="1000" value="1000" />
+      </div>
+
+      <div id="stats" class="stats"></div>
+    </header>
+
+    <main>
+      <canvas id="scene"></canvas>
+
+      <aside id="side">
+        <section id="summary"></section>
+
+        <section id="timeline">
+          <h2>發現軌跡</h2>
+          <canvas id="tl" height="120"></canvas>
+        </section>
+
+        <section id="detail">
+          <h2>族群</h2>
+          <p class="hint">點擊左側任一節點檢視。</p>
+        </section>
+      </aside>
+    </main>
+
+    <footer id="status">尚未載入知識庫。</footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

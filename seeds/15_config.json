@@ -1,0 +1,15 @@
+{
+  "app": "vuln_parser",
+  "mode": "fuzz",
+  "limits": {
+    "max_depth": 128,
+    "max_bytes": 4096
+  },
+  "targets": [
+    "json",
+    "buffer",
+    "integer"
+  ],
+  "replay": false,
+  "null_value": null
+}

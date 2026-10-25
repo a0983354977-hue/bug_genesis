@@ -1,0 +1,31 @@
+# Nim build outputs
+/build/
+/nimcache/
+*.exe
+*.o
+*.obj
+*.dll
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+.hypothesis/
+
+# Node.js dependencies and generated frontend output
+**/node_modules/
+/console/dist/
+
+# Local fuzzing databases, SQLite sidecars, and run logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.log
+/repro.bin
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

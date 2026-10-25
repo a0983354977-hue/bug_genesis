@@ -1,0 +1,1 @@
+{"customer": {"id": 7, "tier": "gold"}, "orders": [{"sku": "A-100", "qty": 2}, {"sku": "B-220", "qty": 1}], "active": true}

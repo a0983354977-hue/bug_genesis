@@ -1,0 +1,489 @@
+# BUG GENESIS — Adapter Protocol v1
+
+**Status**: Normative. This document is the single source of truth shared by the Nim
+core (`src/engine/executor.nim`) and every language adapter
+(`adapters/python/bridge.py`). Any change to field names, value sets, or
+normalisation rules MUST be applied to all implementations in the same change.
+
+Keywords **MUST**, **MUST NOT**, **SHOULD** are to be read as in RFC 2119.
+
+---
+
+## 1. Purpose
+
+The engine's core loop is language-agnostic. It observes a test case, obtains a
+*result*, and classifies it into a bug family. A **target adapter** is the
+component that produces that result on behalf of the core for a target that is
+not natively invoked.
+
+Two adapter kinds exist today:
+
+| kind     | invocation                              |
+|----------|-----------------------------------------|
+| `native` | direct `CreateProcess` / `exec` of the target binary (Phase 1 path) |
+| `python` | persistent `bridge.py` subprocess speaking this protocol |
+
+The classification layer MUST NOT be able to tell which kind produced a result:
+**both paths must yield byte-identical `ExecResult` values for the same
+underlying execution.** §4 and §5 exist to guarantee that.
+
+---
+
+## 2. Transport
+
+### 2.1 Framing
+
+The bridge runs in **serve mode** (`--serve`):
+
+- Nim → bridge: **one JSON object per line** on the bridge's **stdin**, UTF-8, terminated by `\n`.
+- bridge → Nim: **one JSON object per line** on the bridge's **stdout**, UTF-8, terminated by `\n`.
+- The bridge's **stderr MUST NOT** be used for protocol traffic.
+
+Each request produces exactly one response. Requests are strictly serial per
+bridge process.
+
+**Encoding is a normative requirement, not a detail.** Both sides MUST
+communicate UTF-8. `std/json` escapes control characters and quotes but leaves
+non-ASCII text as raw UTF-8 bytes, while Windows gives a **pipe** the console
+codepage — measured here as cp950. Decoding those bytes with cp950 turned the
+`target` path `…新增資料夾…` into lone surrogates, and the bridge then failed to
+locate the binary it was asked to fuzz with `[WinError 123]`. The bridge MUST
+therefore reconfigure its own `sys.stdin` and `sys.stdout` to `encoding="utf-8"`
+at session start rather than inherit the host locale; the Nim side needs no
+step, since `Stream.write` emits the string's bytes unchanged.
+
+**Rationale for line framing over a single spawn-per-request**: measured on the
+development machine, `import hypothesis` costs **477 ms**, versus 33 ms for a
+bare interpreter and ~7 ms for one native target execution. A spawn-per-request
+design would spend 98.5% of its time on interpreter startup and would have to
+batch requests, which in turn couples batch size to worker count in ways that
+destabilise the core loop's accounting. A single long-lived process amortises
+that cost to zero after the first request.
+
+### 2.2 Why stderr is not used for traffic
+
+The core reads protocol traffic from stdout. If the bridge wrote unbounded
+diagnostics to stderr while the core was not draining that pipe, the bridge
+would block once the ~4 KB pipe buffer filled, and the core — blocked reading a
+response that would never come — would hang. Therefore:
+
+- The bridge MUST redirect its own `sys.stderr` to the null device while in serve mode.
+- Before terminating, a bridge that cannot produce a response SHOULD write one
+  well-formed `status=ERROR` line to **stdout** (§6) and then exit non-zero.
+  Reporting on stderr is forbidden because stderr is discarded; if the bridge
+  dies without that last line the core sees only end-of-stream and the reason
+  for the failure is unrecoverable — which is precisely the failure this rule
+  exists to prevent.
+
+### 2.3 Message size
+
+A single request or response MUST remain below 4096 bytes. The core reads each
+response immediately after sending, so larger messages would in practice work,
+but the limit keeps the contract enforceable without depending on reader
+scheduling. Concretely this caps `error_message` at 2048 bytes (§3.3).
+
+The bridge MUST emit the line with an encoder that can represent any content it
+produced — in practice this is automatic once §2.1's UTF-8 reconfiguration is in
+place, because every message is `ensure_ascii=True` and therefore pure ASCII.
+
+---
+
+## 3. Wire schema
+
+### 3.1 Request
+
+```json
+{
+  "v": 1,
+  "op": "execute",
+  "target": "C:/project/build/vuln_parser.exe",
+  "input_file": "C:/temp/bg/worker_3.in",
+  "timeout_ms": 150,
+  "seed": 20261023,
+  "generator": ""
+}
+```
+
+| field        | type    | rules |
+|--------------|---------|-------|
+| `v`          | integer | protocol version; MUST be `1` |
+| `op`         | string  | `"execute"` \| `"generate"` |
+| `target`     | string  | absolute path to the target binary; MUST exist |
+| `input_file` | string  | absolute path. For `execute`, the core has already written the bytes to read — see §3.1.1. For `generate`, the bridge MUST write the generated bytes here before executing. |
+| `timeout_ms` | integer | ≥ 1; per-target-execution budget |
+| `seed`       | integer | non-negative; reproducibility anchor for `generate` |
+| `generator`  | string  | `""` for `execute`; for `generate`, one of §3.4's generator names |
+
+`op` semantics:
+
+- **`execute`** — run the target on the bytes already present at `input_file`.
+  The bridge performs no generation. This exists so a Python-side execution can
+  be exercised against an arbitrary input, including one that came from the
+  native path.
+- **`generate`** — the bridge generates an input using the named Hypothesis
+  strategy, writes it to `input_file`, then runs the target on it. One
+  observation is returned.
+
+Both operations return exactly one observation, so both return the same shape.
+
+#### 3.1.1 The core MUST stage the bytes before asking
+
+The request carries **no payload** — only the path. That makes the file on disk
+the single carrier of the input, so whoever sends `op=execute` owns writing it.
+
+This is not a style preference. Phase 3 shipped with the core writing the file
+only on the native path, which meant every bridge-side `execute` re-ran whatever
+the previous `generate` had left in the worker's file while the knowledge base
+stored the mutation the core *thought* it had tested. Two byte strings, one
+observation. The damage is measurable: of 1088 `hang|TIMEOUT|` cases filed at
+205/255/603 B, the bridge's own trace showed timeouts firing only ever on
+20–21 B files — the stale hanging input — and 86% of the stored cases finished
+normally in 38–57 ms on replay. The knowledge base was asserting defects whose
+stored bytes had never been executed.
+
+So: for `op=execute`, the bytes at `input_file` MUST be exactly the bytes under
+test at the moment the request is written. The bridge MUST NOT generate, patch,
+or top up that file, and it MUST report the path unchanged in its response (§3.2)
+so the core can store what actually ran.
+
+### 3.2 Response
+
+```json
+{
+  "v": 1,
+  "op": "generate",
+  "status": "CRASH_AV",
+  "exit_code": 3221225477,
+  "error_message": "",
+  "coverage_signature": null,
+  "elapsed_ms": 13,
+  "input_file": "C:/temp/bg/worker_3.in",
+  "generator": "hypothesis_nested_json"
+}
+```
+
+| field                | type          | rules |
+|----------------------|---------------|-------|
+| `v`                  | integer       | MUST be `1` |
+| `op`                 | string        | MUST echo the request's `op` |
+| `status`             | string        | §3.3 |
+| `exit_code`          | integer       | §3.3 — **unsigned** representation, see §3.5 |
+| `error_message`      | string        | §3.3 |
+| `coverage_signature` | string \| null| §3.6 |
+| `elapsed_ms`         | integer       | wall-clock ms spent generating + executing |
+| `input_file`         | string        | MUST echo the request's `input_file`; the bytes at this path are the exact bytes that were executed |
+| `generator`          | string        | `""` for `execute`; the generator actually used for `generate` |
+
+The bridge MUST produce `input_file` on disk before responding for `op=generate`.
+The core reads that file to store the input in the knowledge base; the response
+carries no input payload, which keeps messages under §2.3's limit for inputs of
+arbitrary size.
+
+### 3.3 `status`, `exit_code`, `error_message`
+
+**`status`** — one of:
+
+```
+OK            target exited 0
+LOGIC_ERROR   target exited 1 (an exception the target itself caught)
+CRASH_AV      access violation        — Windows 0xC0000005 / POSIX SIGSEGV
+CRASH_STACK   stack overflow          — Windows 0xC00000FD / POSIX SIGSEGV
+CRASH_FPE     arithmetic fault        — Windows 0xC0000094 / POSIX SIGFPE
+CRASH_OTHER   other abnormal termination — Windows other 0xC… / POSIX SIGABRT, SIGILL, SIGBUS
+TIMEOUT       the target exceeded `timeout_ms` and was killed — see §3.3.1
+ERROR         **the adapter made no observation** (§6)
+```
+
+The blueprint enumerates `OK, CRASH_AV, CRASH_FPE, TIMEOUT, LOGIC_ERROR`.
+`CRASH_STACK`, `CRASH_OTHER` and `ERROR` are required extensions:
+
+- `CRASH_STACK` — Phase 1's campaign found stack overflow as a distinct family.
+  Folding it into `CRASH_AV` would merge two unrelated defects into one family
+  on Windows, where the OS *can* distinguish them (`0xC00000FD` vs `0xC0000005`).
+- `CRASH_OTHER` — without it, an unrecognised `0xC…` NTSTATUS has nowhere to go.
+- `ERROR` — without it, a bridge failure is indistinguishable from a target
+  observation, and a broken adapter would silently inject synthetic "failures"
+  into the knowledge base. This is a correctness guarantee, not a convenience.
+
+**`exit_code`** — the operating system's exit code, **normalised to §3.5's
+unsigned 32-bit form**. For `TIMEOUT`, the value is the code observed after the
+kill (Windows reports `0` for `TerminateProcess(handle, 0)`), and MUST NOT be
+used to determine the outcome — see §4.
+
+**`error_message`** — the target's combined stdout and stderr, **UTF-8 decoded
+with `errors="replace"`, capped at 2048 characters**. This is the raw
+observation. It is what the core normalises into a signature (§5), so the bridge
+MUST NOT reformat, prefix, or summarise it. An empty string is normal and
+expected for `CRASH_*` (the target dies before writing anything) and for
+`TIMEOUT`.
+
+#### 3.3.1 `TIMEOUT` is an observation, not a defect
+
+A timeout says only that the target did not finish inside the budget. On a busy
+machine that happens to inputs which terminate perfectly well, and filing one as
+a defect puts a bug in the knowledge base that no one can reproduce.
+
+Phase 3 measured this directly: 1012 observations recorded as `TIMEOUT` against
+the Python target, of which only 141 still hung on replay — 86% finished in
+38–57 ms with the input byte-for-byte unchanged.
+
+Therefore **every timeout MUST be re-run once, at the same budget, before it is
+reported as `TIMEOUT`**:
+
+- second run also times out → report `TIMEOUT`. It is a reproducible hang.
+- second run finishes → report that run's real outcome instead. The first
+  timeout was machine state, and the second run is the only one that describes
+  what the bytes actually did.
+
+Both implementations apply the same rule — the core in `executor.execute`
+(native path) and the bridge in `observe` — because two different rules would
+disagree about the same input depending on which adapter ran it. After this rule
+landed, all 281 stored hangs from a 5200-execution campaign replayed as hangs
+(was: 86% fabricated), and seven cases that do not end in a backslash still hung
+at a 1000 ms budget.
+
+### 3.4 Generators
+
+`generator` for `op="generate"` is one of:
+
+| name                     | strategy shape                                   |
+|--------------------------|--------------------------------------------------|
+| `hypothesis_nested_json` | recursive JSON containers with depth pressure    |
+| `hypothesis_extreme_num` | JSON documents whose numbers sit on integer limits|
+| `hypothesis_string_run`  | strings with long literal runs and escapes       |
+| `hypothesis_malformed`   | structurally broken JSON (truncation, dangling escapes) |
+
+These four are chosen because each one is aimed at a *different, known* defect
+class in the current target — they are not a random assortment. The bridge MUST
+choose deterministically from `seed` so a campaign is replayable, and MUST echo
+the chosen name back in `generator`.
+
+### 3.5 Exit-code representation (normative — this is where drift happens)
+
+JSON has one integer type; the two runtimes represent the same 32-bit pattern
+differently:
+
+- Python's `subprocess` on Windows returns the NTSTATUS as an **unsigned**
+  value: `3221225477` for `0xC0000005`.
+- Nim's `osproc.peekExitCode` returns an **`int32`**: `-1073741819` for the same
+  pattern.
+- Python's `subprocess` on POSIX returns **`-signal`** (`-11` for `SIGSEGV`),
+  while Nim's `osproc` reports **`128 + signal`** (`139`).
+
+Both of Nim's representations are reduced to the same `uint32` by
+`cast[uint32]` inside `normalizeOutcome` / `canonicalCode`, so the storage layer
+never sees the ambiguity. To keep that true across languages:
+
+> **`exit_code` MUST be encoded as an unsigned integer in `[0, 4294967295]`.**
+>
+> - Windows: the raw `DWORD` from `GetExitCodeProcess`.
+> - POSIX: the process exit status if the process exited normally, otherwise
+>   `128 + signal_number`. A bridge observing a negative Python `returncode`
+>   on POSIX MUST convert it with `128 + abs(returncode)` before sending.
+
+The core converts with `cast[int32](uint32(exit_code))`, never by direct
+assignment, which would be a range error for `3221225477`.
+
+Verified empirically on Windows against the project's own target:
+
+| observation | Python `returncode` | required wire value |
+|-------------|--------------------:|--------------------:|
+| access violation | `3221225477` | `3221225477` |
+| integer divide-by-zero | `3221225620` | `3221225620` |
+| stack overflow | `3221225725` | `3221225725` |
+| success | `0` | `0` |
+| caught exception | `1` | `1` |
+
+### 3.6 `coverage_signature`
+
+Optional. **MUST be `null` unless the value is derived from a real coverage
+measurement** — for example a `gcov`/`llvm-cov` digest, an Intel PT trace hash,
+or a source-file/branch bitmap taken from an instrumented build.
+
+**It MUST NOT be synthesised.** Substituting a structural fingerprint of the
+input, a generator name, an exit code, or a hash of `error_message` would
+populate a field that downstream consumers reasonably read as coverage with
+fabricated data. This project's working rules forbid simulated data of any
+kind; a correctly-shaped `null` is strictly better than a plausible lie.
+
+No current bridge collects coverage, so every implementation MUST return
+`null`. The field exists so that when a real source is added, the contract
+already carries it.
+
+---
+
+## 4. Outcome derivation — one authority
+
+The core computes the outcome as:
+
+```nim
+kind = normalizeOutcome(int32(uint32(exit_code)), timedOut = (status == "TIMEOUT"))
+```
+
+`status` is therefore used for **exactly one decision**: whether the run timed
+out. Everything else is derived from `exit_code` by the same
+`normalizeOutcome` function that the native path uses.
+
+**Rationale.** Windows reports `0` for a process killed by
+`TerminateProcess(handle, 0)`. A `status`-driven implementation and an
+`exit_code`-driven implementation will disagree exactly where it matters most —
+a hang must never be recorded as success. Deriving from `exit_code` + an
+explicit `timedOut` flag keeps one function authoritative, which is the only
+reason native and adapter results deduplicate into the same bug family.
+
+**Mirror check.** The core MUST compare the bridge's `status` against the kind
+it derives, for **every** non-`ERROR` status, and report any mismatch on its own
+output. The bridge MUST classify with exactly the table `normalizeOutcome`
+uses, rather than a subset of it:
+
+| wire `exit_code` | Windows (`NTSTATUS`) | POSIX (`128+signal`) |
+|------------------|----------------------|----------------------|
+| `0`              | `OK`                 | `OK`                 |
+| `1`              | `LOGIC_ERROR`        | `LOGIC_ERROR`        |
+| `0xC0000005`, `0xC0000008`, `0xC0000096` | `CRASH_AV` | — |
+| `0xC00000FD`     | `CRASH_STACK`        | —                    |
+| `0xC0000094`, `0xC0000093` | `CRASH_FPE` | —            |
+| other `0xC0000000`–`0xC0FFFFFF` | `CRASH_OTHER` | —      |
+| `139`            | —                    | `CRASH_AV`           |
+| `136`            | —                    | `CRASH_FPE`          |
+| `134`, `132`, `135` | —                  | `CRASH_OTHER`        |
+| anything else    | `LOGIC_ERROR`        | `LOGIC_ERROR`        |
+
+Because both sides use one table, the earlier concern that `SIGSEGV` makes
+`CRASH_AV` and `CRASH_STACK` indistinguishable on POSIX no longer produces
+expected mismatches: both implementations map `139` to `CRASH_AV`, so the
+mirror check passes on every platform. A mismatch therefore always means one
+implementation's table has drifted from the other, and the core reports it
+rather than folding the case into a wrong family. The bridge's `status` is
+trusted for the recorded kind, because only that side held the exit code of the
+actual execution — but the drift is loud.
+
+**Hang threshold granularity (measured, platform-specific).** The native path
+times out on Nim's `QueryPerformanceCounter`. The bridge's `subprocess.run
+timeout=` is implemented against `time.monotonic`, which on this Windows
+Python build is `GetTickCount64` with **0.015625 s** resolution
+(`time.get_clock_info("monotonic")`). The adapter's effective budget is
+therefore `[timeout_ms, timeout_ms + 15.6 ms]`. On the shipped target every
+terminating path finishes in under 10 ms and the hanging paths never terminate,
+so no observation changes across that window — but a target with paths in that
+band would classify differently per adapter, and that is a property of the
+platform, not of the contract. Durations reported in `elapsed_ms` use
+`time.perf_counter` (QPC) precisely because they are not.
+
+---
+
+## 5. Signature
+
+Once the core holds an `ExecResult`, classification is independent of adapter:
+
+```
+signature = kind.label + "|" + canonicalCode + "|" + normalise(output)
+```
+
+where `kind.label` is the storage-vocabulary name (`ok`, `logic_error`,
+`crash_access_violation`, …) — **not** the wire `status`. `canonicalCode` is
+`TIMEOUT` / `EXIT_0` / `EXIT_1` / `NTSTATUS_0x…` / `SIGNAL_…`, computed fromthe reduced `exit_code`. `normalise` applies two rules, in one pass per line:
+
+1. **digit runs → `#`** — line numbers, addresses, values.
+2. **the contents of a quoted span → `#`**, keeping the quotes themselves.
+
+Then lines are joined with ` | `.
+
+Rule 2 exists because targets echo the offending input back in their messages.
+Phase 4's 6000-execution campaign against the Python target produced **1549**
+families, of which 1548 were `logic_error` — and manual inspection showed they
+were only **four** real defects, because `MalformedLine '<input>'` and
+`UnknownSection name='<input>'` printed a different literal for every different
+input. Applying rule 2 collapses that to **46** families (97% merged; measured,
+not asserted — `targets/measure_signature_granularity.py`).
+
+The identity of a defect is its **message template**, not the data that template
+echoes, and the template survives intact: `MalformedLine` and `UnknownSection`
+remain separate families. The differing key stays outside the quotes
+(`key=tls` vs `key=port`, `expected=boolean` vs `expected=integer`), so those
+remain separate too.
+
+Two further rules were measured and **rejected** for merging nothing extra:
+collapsing same-character runs of length ≥ 3 (0 additional merges — the repeats
+are inside quotes and rule 2 already removed them) and abstracting `key=value`
+payload (1 additional merge). Unmeasured complexity is not added.
+
+**The cost, stated plainly because it is a real trade-off:** if two defects
+differ *only* inside a quoted literal, rule 2 merges them. Neither target in this
+repository has such a message — the native target's messages contain no quotes
+at all, and the Python target's distinguishing keys all sit outside quotes. The
+call is deliberate: fragmentation from echoed data hides bugs behind a number
+that looks like coverage ("1500 bugs found" for four defects), which is the more
+dangerous failure of the two.
+
+Both implementations — `executor.normalizeOutput` and the independent one in
+`targets/check_kb_roundtrip.py` — must change together. That check exists to
+fail loudly when they drift.
+
+Because §4 guarantees an identical kind and identical `exit_code`, and §3.3
+guarantees `error_message` is the target's own raw output with no reformatting,
+**the same defect discovered through `native` and through `python` produces the
+same signature** and therefore deduplicates into one family.
+
+This invariant is what makes the adapter layer safe to enable: without it,
+doubling the observation paths would double the apparent number of bugs.
+
+---
+
+## 6. Adapter failure (not an observation)
+
+If the bridge cannot produce a genuine observation — internal exception,
+malformed response, target not found, protocol version mismatch — it MUST
+respond with:
+
+```json
+{"v":1,"op":"execute","status":"ERROR","exit_code":-1,
+ "error_message":"bridge internal error: …","coverage_signature":null,
+ "elapsed_ms":0,"input_file":"…","generator":""}
+```
+
+and, if it cannot respond at all, MUST exit non-zero.
+
+The core MUST:
+
+1. set `ExecResult.invalid = true` (the field that marks *no trustworthy
+   observation*, which is a different fact from `kind = ok`);
+2. report the reason in its campaign log — the bridge's own stderr is
+   discarded by §2.2, so `error_message` is the only surviving account of what
+   went wrong and it MUST NOT be replaced with a generic template;
+3. **MUST NOT** persist the case to `test_cases` or count it toward any bug
+   family, failure rate, or Failure-Directed strategy weight.
+
+A dead bridge (EOF on stdout) MUST cause the worker to respawn the bridge and
+**retry the job once**. A second failure drops the job and is reported.
+
+`observed = false` results are still counted separately as `adapter errors` in
+the campaign summary, so a degrading adapter is visible rather than silently
+reducing coverage. A campaign in which *every* observation is an adapter error
+MUST exit non-zero: zero recorded bugs and “no bugs found” are different claims,
+and only one of them was earned.
+
+---
+
+## 7. Process hygiene
+
+Relevant to the acceptance criterion *"no memory leaks or residual processes"*.
+
+- The core MUST close the bridge's stdin, stdout, and process handles when a
+  worker shuts down, and MUST `kill` the bridge if it is still running at
+  shutdown.
+- The core MUST reap the bridge after every request it terminates early.
+- The bridge MUST NOT spawn detached children; target executions are direct
+  `subprocess.run` calls with `timeout=` so they cannot outlive the bridge.
+- A campaign that ends with the bridge alive, a `.in` file left in the work
+  directory, or a `python.exe` process not started by this campaign, is a defect.
+
+---
+
+## 8. Versioning
+
+`v` is an integer. The core MUST reject a response whose `v` differs from the
+requested `v`, treating it as §6 adapter failure rather than attempting to
+interpret it. Adding an optional field does not bump `v`; changing or removing
+a field, a value set, or a normalisation rule does — and requires updating every
+implementation in the same change.

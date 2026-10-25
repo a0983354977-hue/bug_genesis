@@ -1,0 +1,6 @@
+{
+  "name": "bug-genesis",
+  "version": 1,
+  "enabled": true,
+  "retries": 3
+}
